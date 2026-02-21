@@ -1,0 +1,230 @@
+# ================= Python =================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.virtualenv/
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# ================= Environment Variables =================
+# КРИТИЧНО: Не коммитить секреты!
+.env
+.env.local
+.env.*.local
+*.env
+
+# ================= Databases =================
+# SQLite базы данных
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+legal_bot.db*
+data/legal_bot.db*
+
+# ChromaDB векторная база
+chroma_legal_db/
+*.chroma
+
+# ================= Logs =================
+# Логи приложения
+*.log
+logs/
+data/*.log
+audit.log
+data/audit.log
+
+# ================= Security & Encryption =================
+# КРИТИЧНО: Ключи шифрования
+encryption_key.key
+*.key
+*.pem
+*.crt
+secrets/
+.secrets/
+
+# ================= Data & Exports =================
+# Экспорты пользовательских данных
+exports/
+*.json.export
+my_data_*.json
+user_exports/
+
+# Временные файлы
+*.tmp
+*.temp
+temp/
+tmp/
+
+# ================= Redis =================
+# Redis dump files
+dump.rdb
+appendonly.aof
+*.rdb
+*.aof
+
+# ================= IDE & Editors =================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ================= OS =================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ================= Monitoring & Metrics =================
+# Prometheus data (если запускается локально)
+prometheus_data/
+metrics/
+
+# ================= Backups =================
+# Бэкапы баз данных
+*.bak
+*.backup
+backups/
+*.sql.gz
+
+# ================= Docker (на будущее) =================
+docker-compose.override.yml
+.dockerignore
+
+# ================= Package managers =================
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# ================= Certificates (на будущее) =================
+*.csr
+*.der
+*.p12
+*.pfx
+*.p7b
+*.p7c
+*.p7r
+*.spc
+
+# ================= Project-specific =================
+# Кеш моделей HuggingFace
+.cache/
+huggingface_cache/
+transformers_cache/
+
+# Эмбеддинги и модели
+embeddings/
+models/
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Тестовые данные
+test_data/
+sample_data/
+
+# Документация (если генерируется автоматически)
+docs/_build/
+site/
+
+# ================= Разработка =================
+# Черновики и заметки
+TODO.md
+NOTES.md
+scratch/
+drafts/
+
+# Тестовые скрипты
+test_*.py
+debug_*.py
+experiments/
