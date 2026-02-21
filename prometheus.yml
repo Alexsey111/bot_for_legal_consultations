@@ -1,0 +1,11 @@
+# Prometheus — сбор метрик с бота (bot_questions_total, bot_errors_total и т.д.)
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: "bot"
+    static_configs:
+      # В docker-compose сервис бота доступен по имени "bot"
+      - targets: ["bot:9090"]
+    metrics_path: /metrics

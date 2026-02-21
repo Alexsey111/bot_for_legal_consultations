@@ -25,7 +25,17 @@ log = structlog.get_logger()
 
 # ================= CONFIGURATION =================
 
-DATABASE_PATH = "./data/legal_bot.db"
+def _get_database_path() -> str:
+    """Путь к SQLite из DATABASE_URL или значение по умолчанию."""
+    db_url = os.getenv("DATABASE_URL", "").strip()
+    if db_url and "sqlite" in db_url and "///" in db_url:
+        path = db_url.split("///", 1)[-1].strip()
+        if path:
+            return path
+    return "./data/legal_bot.db"
+
+
+DATABASE_PATH = _get_database_path()
 ALLOWED_TABLES = {"users", "queries", "consultations", "feedback"}
 EXPORTS_DIR = Path("./exports").resolve()
 
@@ -1325,6 +1335,13 @@ class LegalBotDB:
         
         return row
 
+    async def close_pool(self):
+        """
+        Закрытие соединений при остановке бота.
+        Для SQLite (LegalBotDB) — no-op: соединения не пулуются, создаются по требованию.
+        Нужен для совместимости с main.on_shutdown().
+        """
+        pass
 
 
 # ================= SINGLETON FUNCTIONS =================

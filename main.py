@@ -16,7 +16,6 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from typing import List, Optional, Tuple, Dict, Any
 from pathlib import Path
-from contextlib import asynccontextmanager
 from functools import wraps
 import hashlib
 
@@ -35,6 +34,7 @@ from aiogram.types import (
 from aiogram.filters import Command, CommandStart
 from aiogram.filters.command import CommandObject
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ChatAction, ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -53,9 +53,6 @@ from prometheus_client import Counter, Histogram, Gauge, start_http_server
 # Local imports
 from rag_engine import generate_answer, get_cache_stats, get_db_stats
 from sql_logger import get_db_async as get_db  # Используем async-версию для async-кода
-
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
 
 # FSM для записи на консультацию
 class ConsultationForm(StatesGroup):
@@ -207,203 +204,6 @@ metrics_db_connections = Gauge(
     "bot_db_connections",
     "Number of active database connections",
 )
-
-# ================= DATABASE MODELS =================
-
-class DatabaseManager:
-    _instance = None
-    _init_lock = None  # ✅ ИСПРАВЛЕНО: Ленивая инициализация lock
-    
-    @classmethod
-    async def get_instance(cls):
-        """
-        Thread-safe async singleton с ленивой инициализацией lock
-        
-        ИСПРАВЛЕНО:
-        - Lock создаётся при первом вызове (не в момент импорта модуля)
-        - Double-checked locking для избежания race condition
-        - Полностью async-safe
-        """
-        # FAST PATH: инстанс уже создан
-        if cls._instance is not None:
-            return cls._instance
-        
-        # SLOW PATH: первый вызов, нужна инициализация
-        # Ленивая инициализация lock
-        if cls._init_lock is None:
-            cls._init_lock = asyncio.Lock()
-        
-        async with cls._init_lock:
-            # Double-checked locking: проверяем ещё раз внутри lock
-            if cls._instance is None:
-                cls._instance = cls()
-                await cls._instance.init_pool()
-                log.info("database_manager_initialized")
-        
-        return cls._instance
-    
-    def __init__(self):
-        """Private constructor - use get_instance() instead"""
-        if not hasattr(self, 'initialized'):
-            self.db_path = "./legal_bot.db"
-            self._connection_pool: List[aiosqlite.Connection] = []
-            self._pool_size = 5
-            self._lock = None  # Будет создан в init_pool
-            self.initialized = True
-
-
-    
-    async def init_pool(self):
-        """Инициализация connection pool"""
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        
-        async with self._lock:
-            if not self._connection_pool:
-                for _ in range(self._pool_size):
-                    conn = await aiosqlite.connect(self.db_path)
-                    conn.row_factory = aiosqlite.Row
-                    self._connection_pool.append(conn)
-                log.info("db_pool_initialized", pool_size=self._pool_size)
-                await self._create_tables()
-    
-    async def _create_tables(self):
-        """Создание таблиц если не существуют"""
-        conn = self._connection_pool[0]
-        
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                consent_given BOOLEAN DEFAULT 0,
-                consent_date TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                deleted_at TIMESTAMP NULL,
-                anonymized BOOLEAN DEFAULT 0,
-                last_query TIMESTAMP NULL
-            )
-        """)
-        
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_queries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                query_text TEXT NOT NULL,
-                answer_text TEXT,
-                article_nums TEXT,
-                query_type TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                deleted_at TIMESTAMP NULL,
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
-            )
-        """)
-            
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_stats (
-                user_id INTEGER PRIMARY KEY,
-                total_queries INTEGER DEFAULT 0,
-                first_query TIMESTAMP,
-                last_query TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
-            )
-        """)
-            
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_queries_user_id 
-            ON user_queries(user_id)
-        """)
-        
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_queries_created_at 
-            ON user_queries(created_at)
-        """)
-
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_queries_user_created
-            ON user_queries(user_id, created_at DESC)
-        """)
-
-        await conn.execute("PRAGMA foreign_keys = ON;")
-
-        await conn.commit()
-        log.info("db_tables_created")
-    
-    @asynccontextmanager
-    async def get_connection(self):
-        """
-        Context manager для получения соединения из пула
-
-        ИСПРАВЛЕНО: Добавлено единообразное error handling как в sync версии (sql_logger.py)
-        - Rollback при ошибке
-        - Логирование всех ошибок
-        - Автоматический commit при успехе (если вызывающий код не делает явный commit)
-
-        Соответствует sync версии:
-            try:
-                yield conn
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-                logger.error(f"Database error: {e}", exc_info=True)
-                raise
-        """
-        async with self._lock:
-            if not self._connection_pool:
-                await self.init_pool()
-
-            conn = self._connection_pool.pop(0)
-
-        try:
-            # Production-hardened PRAGMA настройки
-            await conn.execute("PRAGMA foreign_keys = ON;")
-            await conn.execute("PRAGMA journal_mode = WAL;")
-            await conn.execute("PRAGMA synchronous = NORMAL;")
-
-            metrics_db_connections.inc()
-            yield conn
-
-            # Автоматический commit при успехе (как в sync версии)
-            await conn.commit()
-        
-        except Exception as e:
-            # Rollback при ошибке (как в sync версии)
-            try:
-                await conn.rollback()
-            except Exception as rollback_err:
-                log.error("rollback_failed", error=str(rollback_err)[:100])
-
-            # Логирование ошибки (как в sync версии)
-            log.error("database_error", error=str(e)[:100])
-            metrics_errors_total.labels(error_type="connection").inc()
-            raise
-
-        finally:
-            async with self._lock:
-                self._connection_pool.append(conn)
-            metrics_db_connections.dec()
-
-    async def close_pool(self, timeout: float = 5.0):
-        """Закрывает pool с timeout для ожидания возврата connections"""
-        start = time.time()
-        
-        while self._connection_pool and (time.time() - start) < timeout:
-            async with self._lock:
-                if len(self._connection_pool) == self._pool_size:
-                    break  # Все connections вернулись
-            await asyncio.sleep(0.1)
-        
-        async with self._lock:
-            if len(self._connection_pool) < self._pool_size:
-                log.warning(
-                    "pool_shutdown_incomplete",
-                    active_connections=self._pool_size - len(self._connection_pool),
-                    timeout_seconds=timeout
-                )
-            
-            for conn in self._connection_pool:
-                await conn.close()
-            self._connection_pool.clear()
-
 
 # ================= REDIS MANAGER =================
 
@@ -3357,8 +3157,8 @@ async def on_shutdown():
     """Действия при остановке бота"""
     logger.info("🛑 Shutting down bot...")
     
-    # Закрываем DB pool
-    await sql_db .close_pool()
+    # Закрываем DB
+    await sql_db.close_pool()
     
     # Закрываем Redis
     await redis_manager.close()

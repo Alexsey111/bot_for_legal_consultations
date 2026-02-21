@@ -1326,29 +1326,16 @@ class LegalRAG:
 # ================= SINGLETON =================
 
 _rag_instance = None
-_rag_lock = Lock()  # 🔒 Потокобезопасная инициализация singleton
+_rag_lock = Lock()  # Потокобезопасная инициализация singleton
 
-
-import threading
-
-_rag_instance = None
-_rag_lock = threading.Lock()
-_rag_initializing = threading.Event()  # Сигнал "инициализация завершена"
 
 def get_rag_engine() -> LegalRAG:
     global _rag_instance
-    
     if _rag_instance is not None:
         return _rag_instance
-    
     with _rag_lock:
         if _rag_instance is None:
             _rag_instance = LegalRAG()
-            _rag_initializing.set()  # Разблокируем ожидающих
-        else:
-            # Другой поток уже инициализировал пока мы ждали
-            pass
-    
     return _rag_instance
 
 

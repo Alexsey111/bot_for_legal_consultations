@@ -25,9 +25,8 @@ PartNumber = Union[str, int]
 
 class Document:
     """
-    Представляет документ (статью ГК РФ)
-    
-    Это пример класса, который может использоваться в RAG-системе
+    Локальный DTO для документа (статьи ГК РФ) в этом модуле.
+    Не путать с langchain_core.documents.Document — в RAG используется именно LangChain Document.
     """
     def __init__(
         self,

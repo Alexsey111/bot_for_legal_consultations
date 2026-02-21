@@ -715,6 +715,10 @@ class GDPRCompliance:
                     f_dict['comment'] = None
             feedback.append(f_dict)
         
+        logger.info(
+            f"GDPR: User {user_id} data exported "
+            f"({len(consultations_decrypted)} consultations)"
+        )
         return {
             "user": user_dict,
             "queries": queries,
@@ -723,12 +727,6 @@ class GDPRCompliance:
             "export_timestamp": str(datetime.now()),
             "gdpr_article": "Article 20 (Right to data portability)"
         }
-
-        
-        # Логируем экспорт
-        logger.info(f"GDPR: User {user_id} data exported ({len(consultations_decrypted)} consultations)")
-        
-        return export_data
 
     
     def anonymize_user_data(self, user_id: int) -> dict:
@@ -1105,8 +1103,13 @@ class FieldLevelEncryptionWrapper:
 
         str_value = str(value)
 
-        # Разные стратегии для разных типов данных
-        if field_type in ['phone', 'email', 'description', 'notes']:
+        # Поля, требующие шифрования (PII и чувствительные тексты)
+        encrypted_field_types = [
+            'phone', 'email', 'description', 'notes',
+            'username', 'first_name', 'last_name',
+            'query_text', 'answer_text', 'comment',
+        ]
+        if field_type in encrypted_field_types:
             try:
                 return self.encryption.encrypt(str_value)
             except Exception as e:
@@ -1145,7 +1148,12 @@ class FieldLevelEncryptionWrapper:
         if encrypted_value is None:
             return None
 
-        if field_type in ['phone', 'email', 'description', 'notes']:
+        encrypted_field_types = [
+            'phone', 'email', 'description', 'notes',
+            'username', 'first_name', 'last_name',
+            'query_text', 'answer_text', 'comment',
+        ]
+        if field_type in encrypted_field_types:
             try:
                 return self.encryption.decrypt(encrypted_value)
             except Exception as e:

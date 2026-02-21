@@ -10,7 +10,7 @@ services:
     volumes:
       - ./knowledge_base:/app/knowledge_base
       - ./chroma_legal_db:/app/chroma_legal_db
-      - ./legal_bot.db:/app/legal_bot.db
+      - ./data:/app/data
     restart: unless-stopped
 
   redis:
