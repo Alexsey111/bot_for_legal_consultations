@@ -4,6 +4,7 @@ database.py
 Разбиение по пунктам статей с сохранением контекста
 """
 
+import os
 import shutil
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
@@ -22,7 +23,7 @@ from gk_structure import get_chapter_for_article, determine_gk_part
 log = structlog.get_logger()
 
 # ================= CONFIG =================
-PERSIST_DIRECTORY = "./chroma_legal_db"
+PERSIST_DIRECTORY = os.getenv("CHROMA_PERSIST_DIR", "./chroma_legal_db")
 COLLECTION_NAME = "gk_rf_articles"
 
 # Используем более дешевую модель для embeddings

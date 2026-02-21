@@ -1,0 +1,43 @@
+# Render Blueprint: Telegram-бот для юридических консультаций по ГК РФ
+# https://docs.render.com/blueprint-spec
+
+services:
+  - type: bgsvc
+    name: legal-consultation-bot
+    runtime: docker
+
+    # Dockerfile at repo root will be used to build the image
+    startCommand: python -u main.py
+
+    # Переменные — секреты задайте в Dashboard (Sync: false)
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: PRODUCTION
+        value: "true"
+      - key: DATABASE_URL
+        value: "sqlite+aiosqlite:////data/legal_bot.db"
+      - key: CHROMA_PERSIST_DIR
+        value: "/data/chroma_legal_db"
+      - key: REDIS_URL
+        fromDatabase:
+          name: legal-bot-redis
+          property: connectionString
+      # REDIS_URL — добавьте вручную после создания Redis (или укажите fromService)
+
+    # Опционально: постоянный диск для SQLite и Chroma
+    plan: starter
+    disk:
+      name: legal-bot-data
+      mountPath: /data
+      sizeGB: 1
+
+# Redis для сессий и rate-limit
+databases:
+  - name: legal-bot-redis
+    plan: free
+    databaseName: legal_bot_redis
