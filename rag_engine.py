@@ -16,7 +16,7 @@ import structlog
 from langchain_core.documents import Document
 from langchain_community.retrievers import BM25Retriever
 from langchain_openai import ChatOpenAI
-# from sentence_transformers import CrossEncoder
+from sentence_transformers import CrossEncoder
 
 from database import LegalVectorDB
 
@@ -703,37 +703,16 @@ class LegalRAG:
     
     def _get_reranker(self):
         """Lazy initialization reranker модели"""
-        import os
-        
-        # Проверяем флаг production
-        is_production = os.getenv('PRODUCTION', 'false').lower() == 'true'
-        
-        if is_production:
-            # Production mode - reranker отключен для экономии RAM
-            if self._reranker is None:
-                log.info("🚀 Production mode: Reranker disabled (экономия 1.4 GB RAM)")
-                self._reranker = "DISABLED"  # Маркер отключения
-            return None
-        
-        # Development mode - загружаем reranker
         if self._reranker is None:
-            try:
-                from sentence_transformers import CrossEncoder
-                log.info("reranker_loading")
-                device = self._get_device()
-                log.info("reranker_device", device=device)
-                self._reranker = CrossEncoder(
-                    "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
-                    device=device
-                )
-                log.info("reranker_loaded")
-            except ImportError as e:
-                log.warning(f"⚠️ sentence-transformers не установлен: {e}")
-                self._reranker = "DISABLED"
-                return None
-        
-        return self._reranker if self._reranker != "DISABLED" else None
-
+            log.info("reranker_loading")
+            device = self._get_device()
+            log.info("reranker_device", device=device)
+            self._reranker = CrossEncoder(
+                "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+                device=device
+            )
+            log.info("reranker_loaded")
+        return self._reranker
 
     # ================= HYBRID SEARCH =================
 
@@ -962,48 +941,43 @@ class LegalRAG:
             log.warning("No documents found!")
             return [], ""
 
-        # ========== 5. Reranking с batch_size для ускорения (опционально)
-        reranker = self._get_reranker()
+        # ========== 5. Reranking с batch_size для ускорения
+        log.info(f"Reranking top {min(len(docs), RERANK_CANDIDATES)} candidates...")
+        
+        candidates_count = min(len(docs), RERANK_CANDIDATES)
+        pairs = [[question, d.page_content] for d in docs[:candidates_count]]
+        
+        # Оптимизация: batch_size для GPU
+        scores = self._get_reranker().predict(pairs, batch_size=16)
 
-        if reranker is None:
-            # Production mode - reranker отключен, используем документы как есть
-            log.info(f"⚡ Reranker disabled, returning top {RERANK_TOP_K} without reranking")
-            top_docs = docs[:RERANK_TOP_K]
-        else:
-            # Development mode - используем reranking
-            log.info(f"Reranking top {min(len(docs), RERANK_CANDIDATES)} candidates...")
-            
-            candidates_count = min(len(docs), RERANK_CANDIDATES)
-            pairs = [[question, d.page_content] for d in docs[:candidates_count]]
-            
-            # Оптимизация: batch_size для GPU
-            scores = reranker.predict(pairs, batch_size=16)
-            
-            # Сортируем по score
-            ranked = sorted(
-                zip(docs[:candidates_count], scores),
-                key=lambda x: x[1],
-                reverse=True
+        # Сортируем по score
+        ranked = sorted(
+            zip(docs[:candidates_count], scores),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        # НОВОЕ: Фильтрация по threshold
+        top_docs = [
+            doc for doc, score in ranked[:RERANK_TOP_K]
+            if score >= RERANK_SCORE_THRESHOLD  # Только релевантные
+        ]
+
+        log.info(
+            f"Reranking: {len(ranked)} candidates -> {len(top_docs)} "
+            f"above threshold ({RERANK_SCORE_THRESHOLD})"
+        )
+
+        # ИСПРАВЛЕНО: Fallback к top-k без threshold, если ничего не прошло фильтрацию
+        if not top_docs:
+            log.warning(
+                f"No documents above threshold for query: {question[:100]}, "
+                f"using fallback to top-{RERANK_TOP_K}"
             )
+            top_docs = [doc for doc, score in ranked[:RERANK_TOP_K]]
 
-            # Фильтрация по threshold
-            top_docs = [
-                doc for doc, score in ranked[:RERANK_TOP_K]
-                if score >= RERANK_SCORE_THRESHOLD
-            ]
-
-            log.info(
-                f"Reranking: {len(ranked)} candidates -> {len(top_docs)} "
-                f"above threshold ({RERANK_SCORE_THRESHOLD})"
-            )
-
-            # Fallback если ничего не прошло
-            if not top_docs:
-                log.warning(
-                    f"No documents above threshold, using fallback to top-{RERANK_TOP_K}"
-                )
-                top_docs = [doc for doc, score in ranked[:RERANK_TOP_K]]
-
+        context = self._build_context(top_docs, query_type, show_full=False)
+        return top_docs, context
 
     # ================= CONTEXT =================
 
