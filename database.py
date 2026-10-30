@@ -396,7 +396,13 @@ class LegalVectorDB:
     def __init__(self):
         self.embeddings = OpenAIEmbeddings(
             model=EMBEDDING_MODEL,
-            chunk_size=1000
+            chunk_size=1000,
+            # DEF-009/DEF-018: не токенизировать вход локально. По умолчанию
+            # OpenAIEmbeddings переводит текст в токены через tiktoken, а тот
+            # тянет словарь BPE из сети: в закрытом контуре либо падение, либо
+            # (если словарь подменить) тихо испорченные векторы. Модель умеет
+            # принимать текст сама, и векторы получаются те же.
+            check_embedding_ctx_length=False,
         )
         self.vector_db = None
         log.info("embedding_model_initialized", model=EMBEDDING_MODEL)
@@ -449,6 +455,49 @@ class LegalVectorDB:
             log.info("progress", current=progress, total=len(documents), percent=f"{percentage:.1f}%")
         
         log.info("database_rebuild_complete", chunks=len(documents))
+
+        # DEF-018: сборка не должна считаться успешной, если векторы не
+        # соответствуют текстам. Проверяем выборку: пересчитываем эмбеддинги
+        # пяти случайных чанков и сверяем с тем, что лежит в коллекции.
+        self._verify_embeddings_alignment(sample_size=5)
+
+    def _verify_embeddings_alignment(self, sample_size: int = 5, threshold: float = 0.99) -> None:
+        """Сверяет сохранённые векторы с пересчитанными по тем же текстам.
+
+        Ровно эта проверка ловит случай, когда индексация «прошла успешно»,
+        а в базе лежат чужие векторы: tiktoken недоступен, вместо него
+        подставлена заглушка, все тексты одинаковой длины уходят в модель
+        одинаковым входом. Ни ошибки, ни предупреждения при этом не возникает.
+        """
+        import random
+
+        import numpy as np
+
+        data = self.vector_db.get(include=["embeddings", "documents"])
+        docs, emb = data["documents"], np.array(data["embeddings"], float)
+        if not docs:
+            raise RuntimeError("индекс пуст — сборка не удалась")
+
+        idx = random.sample(range(len(docs)), min(sample_size, len(docs)))
+        fresh = self.embeddings.embed_documents([docs[i] for i in idx])
+
+        worst = 1.0
+        for i, vec in zip(idx, fresh):
+            a, b = emb[i], np.array(vec, float)
+            cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+            worst = min(worst, cos)
+
+        if worst < threshold:
+            log.error("embeddings_alignment_failed", worst_cosine=round(worst, 4),
+                      sample=len(idx))
+            raise RuntimeError(
+                f"индекс собран с ошибкой: вектор не соответствует тексту "
+                f"(косинус {worst:.4f}, ожидалось ≥ {threshold}). "
+                f"Проверьте, что эмбеддинги считаются без токенизации "
+                f"(check_embedding_ctx_length=False) и что модель та же, что на запросе."
+            )
+
+        log.info("embeddings_alignment_ok", worst_cosine=round(worst, 4), sample=len(idx))
     
     def _get_collection_count(self) -> int:
         """
