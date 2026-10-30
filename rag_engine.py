@@ -5,6 +5,7 @@ rag_engine.py
 """
 
 import re
+import os
 import hashlib
 from typing import List, Tuple, Optional, Dict, Any
 from collections import OrderedDict, defaultdict
@@ -31,6 +32,27 @@ BM25_TOP_K = 15
 RERANK_CANDIDATES = 25  # Количество документов для reranking
 RERANK_TOP_K = 5        # Финальное количество после reranking
 RERANK_SCORE_THRESHOLD = 0.3  # Минимальный score для включения документа
+
+# ===== Порог «это вообще про ГК?» (DEF-002, DEF-017) =====
+# Измерено на 20 вопросах по ГК и 12 посторонних (tools/qa_threshold_rules.py):
+#   свои вопросы:  лучший косинус 0.376 … 0.719
+#   чужие вопросы: лучший косинус 0.177 … 0.440
+# Один порог по косинусу разделяет плохо, поэтому два правила:
+#   1) лучший чанк совсем далёк (< 0.33) — отказ без разговоров;
+#   2) чанк средний (< 0.45) и ни одно значимое слово вопроса не встречается
+#      в найденных текстах — тоже отказ.
+# На размеченном наборе: 0 ложных отказов своим, 12 из 12 чужих отбито.
+RELEVANCE_HARD_COSINE = float(os.getenv("RELEVANCE_HARD_COSINE", "0.33"))
+RELEVANCE_SOFT_COSINE = float(os.getenv("RELEVANCE_SOFT_COSINE", "0.45"))
+RELEVANCE_MIN_COVERAGE = float(os.getenv("RELEVANCE_MIN_COVERAGE", "0.34"))
+RELEVANCE_PROBE_K = 20  # сколько чанков смотреть при проверке темы
+
+# DEF-016: список запрещённых фраз раньше только писал в лог, то есть не работал
+# вовсе. По умолчанию он теперь помечает ответ (пометка видна пользователю),
+# а блокировка включается флагом — потому что выбросить верный ответ из-за
+# одного слова «возможно» хуже, чем показать его с оговоркой. Решение
+# о строгом режиме — за владельцем продукта.
+STRICT_UNCERTAIN_WORDING = os.getenv("STRICT_UNCERTAIN_WORDING", "0") == "1"
 
 LLM_MODEL = "gpt-4o-mini"
 LLM_TEMPERATURE = 0.2
@@ -358,6 +380,12 @@ class QueryClarifier:
         Определяет нужны ли уточнения
         Returns: Текст уточняющего вопроса или None
         """
+        # Нет документов — уточнять нечего: вопрос не по теме, и вызывающий
+        # вернёт отказ. Раньше правило «короткий вопрос + общее слово»
+        # срабатывало даже на пустом наборе («как приготовить борщ»).
+        if not docs:
+            return None
+
         question_lower = question.lower()
 
         # Слишком общие вопросы
@@ -374,7 +402,11 @@ class QueryClarifier:
         # Если найдено много разных статей из разных тем
         if len(docs) > 0:
             parts = set(doc.metadata.get("part") for doc in docs[:5] if doc.metadata.get("part"))
-            if len(parts) >= 3:  # Статьи из 3+ частей ГК
+            if len(parts) >= 3 and len(question.split()) <= 4:
+                # Уточняем только когда вопрос сам по себе короткий и общий.
+                # Раньше правило срабатывало на любые документы из 3+ частей ГК,
+                # и нормальный вопрос «можно ли расторгнуть договор аренды
+                # досрочно» получал встречный вопрос вместо ответа.
                 return (
                     "❓ Ваш вопрос затрагивает несколько разделов ГК РФ.\n\n"
                     "Уточните, пожалуйста:\n"
@@ -566,16 +598,68 @@ class RuleBasedRouter:
 class AnswerValidator:
     """Валидирует ответы LLM перед отправкой пользователю"""
 
+    # DEF-005: раньше здесь были две разные регулярки, и обе не знали косвенных
+    # падежей — «статьёй 196», «статьям 454», «статей 196» считались ответом
+    # без ссылок. Теперь одна основа «стат+ь/е/ё» на все формы (включая
+    # «статей», где мягкого знака нет), плюс «ст.» и «№».
+    ARTICLE_REF_RE = re.compile(
+        r"стат[ьеё]\w*\s*(?:№\s*)?(\d+(?:\.\d+)?)"
+        r"|ст\.?\s*(?:№\s*)?(\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    )
+    # Продолжение перечисления: «статьям 454 и 455», «статей 196, 200».
+    # Число не считается статьёй, если за ним идёт единица измерения.
+    ENUM_TAIL_RE = re.compile(
+        r"\s*(?:,|и|или)\s*(\d+(?:\.\d+)?)"
+        r"(?!\s*(?:год|лет|месяц|дн|руб|процент|тыс|коп))",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def articles_in(cls, text: str) -> set:
+        """Номера статей, упомянутых в тексте, в любом падеже и перечислении."""
+        found = set()
+        for m in cls.ARTICLE_REF_RE.finditer(text):
+            num = m.group(1) or m.group(2)
+            if not num:
+                continue
+            found.add(num)
+            pos = m.end()
+            while True:
+                tail = cls.ENUM_TAIL_RE.match(text, pos)
+                if not tail:
+                    break
+                found.add(tail.group(1))
+                pos = tail.end()
+        return found
+
     def __init__(self, db: LegalVectorDB):
         self.db = db
+        self.warnings: List[str] = []
+        self.reason_code: Optional[str] = None
+
+    def _article_exists(self, num: str) -> bool:
+        """Есть ли такая статья в кодексе (не в выборке поиска, а вообще)."""
+        if self.db is None:
+            return False
+        try:
+            return bool(self.db.get_article_by_number(num))
+        except Exception as e:
+            # Проверить не смогли — не обвиняем модель в выдумке
+            log.warning("article_exists_check_failed", article=num, error=str(e))
+            return True
 
     def validate(self, question: str, answer: str, context_docs: List[Document]) -> Tuple[bool, Optional[str]]:
         """
         Валидирует ответ
         Returns: (is_valid, error_message)
         """
+        self.warnings = []
+        self.reason_code = None
+
         # ========== 1. Проверка длины ==========
         if len(answer) < 50:
+            self.reason_code = "too_short"
             return False, "Ответ слишком короткий"
 
         # ========== 2. Проверка упоминания источников (СМЯГЧЕНО) ==========
@@ -583,16 +667,20 @@ class AnswerValidator:
         question_lower = question.lower()
         system_keywords = ["запис", "консультац", "помощь", "контакт", "связ"]
         is_system_question = any(kw in question_lower for kw in system_keywords)
-        
-        has_article_refs = bool(re.search(r'ст(?:атья|\.)\s*\d+', answer, re.IGNORECASE))
-        
+
+        has_article_refs = bool(self.ARTICLE_REF_RE.search(answer))
+
         if not has_article_refs and not is_system_question:
-            # Только для юридических вопросов требуем ссылки
-            return False, "Ответ не содержит ссылок на статьи"
+            # DEF-013: ответ без ссылки больше не выбрасывается. Раньше здесь
+            # был отказ, и вместо консультации человек получал техническое
+            # «ответ не содержит ссылок» — то есть система выбрасывала
+            # собственный ответ и объясняла это своими внутренними правилами.
+            self.warnings.append("no_citation")
+            self.reason_code = "no_citation"
+            log.warning("answer_without_citation", question=question[:80])
 
         # ========== 3. Проверка галлюцинаций статей ==========
-        mentioned_articles = re.findall(r'стать[ияюе]\s+(\d+)|ст\.?\s*(\d+)', answer, re.IGNORECASE)
-        mentioned_articles = set(a[0] or a[1] for a in mentioned_articles)
+        mentioned_articles = self.articles_in(answer)
 
         context_articles = set()
         for doc in context_docs:
@@ -609,16 +697,25 @@ class AnswerValidator:
 
         # Проверяем, что все упомянутые статьи есть в контексте
         hallucinated = mentioned_articles - context_articles
-        
+
         if hallucinated:
-            # СМЯГЧЕНО: разрешаем до 2 галлюцинаций если есть другие правильные статьи
-            if len(hallucinated) <= 2 and len(mentioned_articles - hallucinated) > 0:
-                log.warning("minor_hallucination_allowed", articles=list(hallucinated))
-                # Разрешаем ответ с предупреждением
-            else:
-                # Серьезная галлюцинация - отклоняем
-                log.error("hallucination_detected", articles=list(hallucinated))
-                return False, f"Обнаружены ссылки на статьи вне контекста: {', '.join(sorted(hallucinated))}"
+            # DEF-013 (продолжение): раньше до двух «выдуманных» статей
+            # пропускались, если рядом была хоть одна верная — то есть ответ
+            # с придуманной нормой уходил пользователю. Теперь ссылка вне
+            # контекста проверяется по самому кодексу: статья, которая в ГК
+            # есть, — это не выдумка, а просто не попавшая в выборку норма;
+            # статьи, которой в кодексе нет, в ответе быть не может.
+            missing = {a for a in hallucinated if not self._article_exists(a)}
+            extra_but_real = hallucinated - missing
+
+            if extra_but_real:
+                self.warnings.append("cited_outside_context")
+                log.warning("article_outside_context", articles=sorted(extra_but_real))
+
+            if missing:
+                log.error("hallucination_detected", articles=sorted(missing))
+                self.reason_code = "hallucination"
+                return False, f"Обнаружены ссылки на статьи вне контекста: {', '.join(sorted(missing))}"
 
         # ========== 4. Проверка запрещенных фраз ==========
         forbidden = [
@@ -628,11 +725,16 @@ class AnswerValidator:
         answer_lower = answer.lower()
         for phrase in forbidden:
             if phrase in answer_lower:
+                self.warnings.append("uncertain_wording")
                 log.warning("answer_forbidden_phrase", phrase=phrase)
-                # Не блокируем, но логируем
+                if STRICT_UNCERTAIN_WORDING:
+                    self.reason_code = "uncertain_wording"
+                    return False, "Ответ содержит неуверенные формулировки"
+                break
 
         # ========== 5. Проверка на пустые/бессмысленные ответы ==========
         if answer.count('...') > 3:
+            self.reason_code = "too_many_ellipsis"
             return False, "Ответ содержит слишком много многоточий"
 
         # ========== 6. Проверка наличия цитат (ОПЦИОНАЛЬНО) ==========
@@ -744,14 +846,15 @@ class LegalRAG:
         all_docs = self.db.get_all_documents()
         log.info("documents_loaded", count=len(all_docs))
 
-        # Semantic retriever с MMR для разнообразия результатов
+        # Semantic retriever: обычная близость, без MMR.
+        # MMR с lambda_mult=0.5 намеренно выкидывает близкие соседние нормы ради
+        # «разнообразия» — и терял нужную статью (на «наём жилого помещения»
+        # приносил 678, 685, 686, 672, 684 вместо 671). Разнообразие теперь
+        # делает склейка повторов статьи в _hybrid_retrieve, поэтому здесь
+        # нужен честный top-K по близости.
         self.semantic_retriever = self.db.vector_db.as_retriever(
-            search_type="mmr",
-            search_kwargs={
-                "k": SEMANTIC_TOP_K,
-                "fetch_k": 20,  # Количество кандидатов для MMR
-                "lambda_mult": 0.5  # Баланс: 0.5 = 50% релевантность, 50% разнообразие
-            }
+            search_type="similarity",
+            search_kwargs={"k": SEMANTIC_TOP_K},
         )
 
         # BM25 retriever
@@ -761,45 +864,49 @@ class LegalRAG:
         log.info("hybrid_search_ready")
 
     def _hybrid_retrieve(self, question: str) -> List[Document]:
+        """Гибридный поиск: слияние по рангам (RRF) и склейка повторов статьи.
+
+        Раньше список собирался «сначала вся семантика, потом весь BM25» — то
+        есть если семантика ошибалась, у BM25 не оставалось шанса попасть в
+        первую пятёрку. Плюс в выдаче оставались дубли одной статьи: на вопрос
+        «дарение что это» приходило 572, 572, 573, 574, 572 — три слота из пяти
+        занимала одна норма.
+
+        Теперь: RRF по двум спискам, затем по одной статье на позицию
+        (остаётся лучший по рангу фрагмент статьи).
         """
-        ИСПРАВЛЕНО: Гибридный поиск с надежной дедупликацией
-        Использует doc_id для идентификации уникальных документов
-        """
-        # Semantic search
         semantic_docs = self.semantic_retriever.invoke(question)
-        
-        # BM25 search
         bm25_docs = self.bm25_retriever.invoke(question)
-        
-        # Объединяем и дедуплицируем по doc_id
-        seen_doc_ids = set()
-        merged = []
-        
-        # Сначала semantic (больший вес)
-        for doc in semantic_docs:
-            doc_id = doc.metadata.get("doc_id")
-            if doc_id and doc_id not in seen_doc_ids:
-                seen_doc_ids.add(doc_id)
-                merged.append(doc)
-            elif not doc_id:
-                # Fallback для документов без doc_id (не должно быть в production)
-                log.warning("document_without_doc_id", reference=doc.metadata.get('reference', 'unknown'))
-                merged.append(doc)
-        
-        # Потом BM25
-        for doc in bm25_docs:
-            doc_id = doc.metadata.get("doc_id")
-            if doc_id and doc_id not in seen_doc_ids:
-                seen_doc_ids.add(doc_id)
-                merged.append(doc)
-            elif not doc_id:
-                # Fallback для документов без doc_id
-                log.warning("document_without_doc_id", reference=doc.metadata.get('reference', 'unknown'))
-                merged.append(doc)
+
+        RRF_K = 60.0
+        scores: Dict[str, float] = {}
+        by_key: Dict[str, Document] = {}
+        order_hint: Dict[str, int] = {}       # для стабильной сортировки при равных баллах
+
+        for weight, docs in ((1.0, semantic_docs), (1.0, bm25_docs)):
+            for rank, doc in enumerate(docs):
+                key = str(doc.metadata.get("doc_id") or doc.metadata.get("reference") or doc.page_content[:60])
+                scores[key] = scores.get(key, 0.0) + weight / (RRF_K + rank)
+                by_key.setdefault(key, doc)
+                order_hint.setdefault(key, len(order_hint))
+
+        ranked = sorted(scores, key=lambda k: (-scores[k], order_hint[k]))
+
+        seen_articles = set()
+        merged: List[Document] = []
+        for key in ranked:
+            doc = by_key[key]
+            article = str(doc.metadata.get("article_num") or "")
+            if article and article in seen_articles:
+                continue                      # та же статья уже есть в выдаче
+            if article:
+                seen_articles.add(article)
+            merged.append(doc)
 
         log.info(
-            f"Hybrid search: semantic={len(semantic_docs)}, bm25={len(bm25_docs)}, "
-            f"merged={len(merged)}, unique_doc_ids={len(seen_doc_ids)}"
+            "hybrid_search_rrf",
+            semantic=len(semantic_docs), bm25=len(bm25_docs),
+            merged=len(merged), articles=len(seen_articles),
         )
         return merged
 
@@ -868,7 +975,43 @@ class LegalRAG:
                 log.warning(f"Unsafe query detected (pattern: {pattern}): {match.group(0)}")
                 return False
 
+        # DEF-015: вторая проверка — по нормализованному тексту. Регулярки выше
+        # знают только точные формулировки: «игнорируй, пожалуйста, все
+        # инструкции» проходило, потому что между глаголом и словом
+        # «инструкции» появилось лишнее слово. Здесь пунктуация снимается,
+        # а глагол-приказ и объект ищутся по отдельности.
+        if self._injection_by_tokens(text):
+            log.warning(f"Unsafe query detected (tokens): {text[:80]}")
+            return False
+
         return True
+
+    # ---------- DEF-015 ----------
+    # Только повелительные формы: «игнорируй», но не «игнорировать» —
+    # иначе обычный юридический вопрос про ограничения считался бы атакой.
+    INJECTION_VERBS = (
+        "игнорируй", "проигнорируй", "забудь", "не обращай внимания",
+        "ignore", "forget", "disregard", "override", "bypass", "dismiss", "neglect",
+    )
+    INJECTION_OBJECTS = (
+        "инструкц", "промпт", "команд", "ограничен", "правил",
+        "instructions", "prompts", "commands", "constraints", "rules",
+    )
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Нижний регистр, ё→е, пунктуация в пробелы, пробелы схлопнуты."""
+        t = text.lower().replace("ё", "е")
+        t = re.sub(r"[^\w\s]+", " ", t, flags=re.UNICODE)
+        return re.sub(r"\s+", " ", t).strip()
+
+    @classmethod
+    def _injection_by_tokens(cls, text: str) -> bool:
+        norm = cls._normalize_text(text)
+        return (
+            any(v in norm for v in cls.INJECTION_VERBS)
+            and any(o in norm for o in cls.INJECTION_OBJECTS)
+        )
 
 
     def _sort_by_point_number(self, docs: List[Document]) -> List[Document]:
@@ -897,6 +1040,95 @@ class LegalRAG:
         return sorted(docs, key=point_sort_key)
 
     # ================= RETRIEVAL =================
+
+    # ---------- DEF-002/DEF-017: «это вообще про ГК?» ----------
+    TOPIC_STOPWORDS = frozenset(
+        "что такое как какие какой какая кто где когда можно ли это для или по на в не"
+        " мне мой моя мои его её их мы вы они ты я чем чтобы если".split()
+    )
+
+    def _content_words(self, question: str) -> List[str]:
+        """Значимые слова вопроса: длиннее трёх букв, не служебные."""
+        return [
+            w for w in re.findall(r"[а-яёa-z]{4,}", question.lower())
+            if w not in self.TOPIC_STOPWORDS
+        ]
+
+    # Вопросы из других отраслей права: по смыслу они рядом с ГК, по косинусу
+    # неотличимы («какое наказание за кражу» — 0.40, как у своих вопросов).
+    OTHER_BRANCH_MARKERS = (
+        "наказание", "уголовн", "лишение свободы", "приговор", "административн",
+        "гибдд", "прописк", "штрафстоянк", "депутат", "налогов", "таможн",
+    )
+    # ...но если человек спрашивает про гражданские последствия того же
+    # события («как взыскать ущерб от кражи»), это уже ГК — не отказываем.
+    CIVIL_MARKERS = (
+        "взыска", "возмест", "ущерб", "договор", "сделк", "иск", "компенсац",
+        "неустойк", "убытк", "наследств", "собственност", "аренд", "займ",
+    )
+
+    # ---------- DEF-014: сообщение об отказе для человека ----------
+    @staticmethod
+    def _refusal_message(reason_code: Optional[str]) -> str:
+        """Текст отказа без внутренней терминологии.
+
+        Раньше человек читал «Причина: Ответ не содержит ссылок на статьи» —
+        это формулировка проверки, а не сообщение для него.
+        """
+        if reason_code == "hallucination":
+            head = "Не могу подтвердить этот ответ по тексту кодекса, поэтому не отдаю его.\n\n"
+        else:
+            head = "Не получилось подготовить ответ по этому вопросу.\n\n"
+        return (
+            head
+            + "Что можно попробовать:\n"
+            "• Спросить про конкретную статью — например: «что говорит статья 454»\n"
+            "• Описать ситуацию подробнее: кто, что и когда сделал\n"
+            + "• Открыть /help"
+        )
+
+    def check_topic_relevance(self, question: str) -> Dict[str, Any]:
+        """Проверяет, относится ли вопрос к гражданскому кодексу вообще.
+
+        Считает два признака по одному запросу в Chroma:
+          best_cosine — насколько близок лучший найденный чанк;
+          coverage    — доля значимых слов вопроса, встретившихся в top-5.
+
+        Отказ, если лучший чанк совсем далёк, либо если он средний и в текстах
+        нет ни одного слова из вопроса. Пороги измерены на размеченном наборе
+        (20 своих вопросов, 12 посторонних): 0 ложных отказов, 12/12 чужих.
+        """
+        try:
+            probe = self.db.vector_db.similarity_search_with_score(question, k=RELEVANCE_PROBE_K)
+        except Exception as e:  # поиск не должен ломать ответ из-за проверки темы
+            log.warning("relevance_probe_failed", error=str(e))
+            return {"relevant": True, "best_cosine": 1.0, "coverage": 1.0}
+
+        if not probe:
+            return {"relevant": False, "best_cosine": 0.0, "coverage": 0.0}
+
+        # Chroma в L2-пространстве при единичных векторах: cos = 1 - dist/2
+        best = 1.0 - probe[0][1] / 2.0
+        low = question.lower()
+
+        if any(m in low for m in self.OTHER_BRANCH_MARKERS) and not any(
+            m in low for m in self.CIVIL_MARKERS
+        ):
+            return {"relevant": False, "best_cosine": best, "coverage": 0.0,
+                    "reason": "other_branch"}
+
+        words = self._content_words(question)
+        if not words:
+            # одни служебные слова («можно ли») — пусть решает уточняющий вопрос
+            return {"relevant": True, "best_cosine": best, "coverage": 0.0}
+
+        texts = " ".join(d.page_content.lower() for d, _ in probe[:5])
+        coverage = sum(1 for w in words if w[:5] in texts) / len(words)
+
+        relevant = best >= RELEVANCE_HARD_COSINE and (
+            best >= RELEVANCE_SOFT_COSINE or coverage >= RELEVANCE_MIN_COVERAGE
+        )
+        return {"relevant": relevant, "best_cosine": best, "coverage": coverage}
 
     def retrieve_documents(self, question: str, query_type: Dict) -> Tuple[List[Document], str]:
         """Получает релевантные документы в зависимости от типа запроса"""
@@ -955,7 +1187,20 @@ class LegalRAG:
 
         # Общий вопрос - гибридный поиск
         log.info(f"Retrieving for general query: {question[:100]}...")
-        
+
+        # DEF-002/DEF-017: сначала «это вообще про ГК?», потом поиск и уточнения.
+        # Без этой проверки бот на «как приготовить борщ» находил три статьи
+        # из разных частей кодекса и предлагал уточнить вид договора.
+        relevance = self.check_topic_relevance(question)
+        if not relevance["relevant"]:
+            log.warning(
+                "off_topic_question",
+                question=question[:100],
+                best_cosine=round(relevance["best_cosine"], 3),
+                coverage=round(relevance["coverage"], 2),
+            )
+            return [], ""
+
         docs = self._hybrid_retrieve(question)
 
         if not docs:
@@ -1003,6 +1248,12 @@ class LegalRAG:
                     f"No documents above threshold, using fallback to top-{RERANK_TOP_K}"
                 )
                 top_docs = [doc for doc, score in ranked[:RERANK_TOP_K]]
+
+        # ВАЖНО: без этого return функция возвращала None, и generate_answer
+        # падал на распаковке `docs, context = ...`. Дефект DEF-001.
+        context = self._build_context(top_docs, query_type)
+        log.info(f"Retrieved {len(top_docs)} docs for general query")
+        return top_docs, context
 
 
     # ================= CONTEXT =================
@@ -1312,12 +1563,25 @@ class LegalRAG:
             is_valid, error_msg = validator.validate(question, answer, docs)
 
             if not is_valid:
-                log.error(f"Answer validation failed: {error_msg}")
-                return (
-                    "❌ Не удалось сформировать корректный ответ на ваш вопрос.\n\n"
-                    f"Причина: {error_msg}\n\n"
-                    "Попробуйте переформулировать вопрос или используйте /help"
+                # DEF-014: внутреннюю причину — в лог, человеку — что делать.
+                log.error("answer_validation_failed", reason=validator.reason_code,
+                          detail=error_msg)
+                return self._refusal_message(validator.reason_code)
+
+            # DEF-013: ответ без ссылки отдаём, но честно говорим, чего в нём нет
+            if "no_citation" in validator.warnings:
+                answer += (
+                    "\n\nℹ️ <i>В ответе нет ссылки на конкретную статью. "
+                    "Если нужна точная норма — спросите прямо: "
+                    "«что говорит статья 454».</i>"
                 )
+
+            # DEF-016: оговорки в ответе помечаем видимо для человека
+            if "uncertain_wording" in validator.warnings:
+                answer = (
+                    "⚠️ <i>В ответе есть слова вроде «возможно» или «вероятно»: "
+                    "однозначной нормы под вашу ситуацию найти не удалось.</i>\n\n"
+                ) + answer
 
             # Добавляем дисклеймер
             answer += (

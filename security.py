@@ -287,6 +287,12 @@ class EncryptionManager:
         Raises:
             EncryptionError: Если шифрование не удалось после всех попыток
         """
+        # DEF-006: контракт для пустой строки. Шифровать нечего — возвращаем
+        # пустую строку, как и decrypt(""). Иначе в базе оказывается шифротекст
+        # от пустого значения, и отличить «поля нет» от «поле пустое» нельзя.
+        if data is None or data == "":
+            return ""
+
         for attempt in range(retry_count):
             try:
                 encrypted = Fernet(self.keys[0]).encrypt(data.encode())
