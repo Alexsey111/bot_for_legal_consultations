@@ -804,16 +804,29 @@ class LegalRAG:
         return "cpu"
     
     def _get_reranker(self):
-        """Lazy initialization reranker модели"""
-        if self._reranker is None:
+        """Lazy initialization reranker модели.
+
+        DEF-019: если веса модели недоступны (нет сети, кэша HuggingFace или
+        несовместимая версия), раньше исключение вылетало из retrieve_documents
+        и общий вопрос падал целиком. Теперь модель грузится в try, отказ
+        запоминается, и поиск продолжается в порядке слияния (семантика + BM25)
+        без реранка. Деградация вместо падения: ответ может быть хуже
+        отсортирован, но он будет.
+        """
+        if self._reranker is None and not getattr(self, "_reranker_failed", False):
             log.info("reranker_loading")
-            device = self._get_device()
-            log.info("reranker_device", device=device)
-            self._reranker = CrossEncoder(
-                "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
-                device=device
-            )
-            log.info("reranker_loaded")
+            try:
+                device = self._get_device()
+                log.info("reranker_device", device=device)
+                self._reranker = CrossEncoder(
+                    "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+                    device=device
+                )
+                log.info("reranker_loaded")
+            except Exception as e:  # noqa: BLE001 — любая причина отказа = без реранка
+                self._reranker = None
+                self._reranker_failed = True
+                log.warning("reranker_load_failed", error=str(e))
         return self._reranker
 
     # ================= HYBRID SEARCH =================
@@ -1193,7 +1206,15 @@ class LegalRAG:
         pairs = [[question, d.page_content] for d in docs[:candidates_count]]
         
         # Оптимизация: batch_size для GPU
-        scores = self._get_reranker().predict(pairs, batch_size=16)
+        reranker = self._get_reranker()
+        if reranker is None:
+            # DEF-019: реранкер недоступен — не падаем, отдаём порядок слияния
+            log.warning("reranker_unavailable_fallback", question=question[:100])
+            top_docs = docs[:RERANK_TOP_K]
+            context = self._build_context(top_docs, query_type, show_full=False)
+            return top_docs, context
+
+        scores = reranker.predict(pairs, batch_size=16)
 
         # Сортируем по score
         ranked = sorted(
