@@ -101,7 +101,8 @@ def judge(kind, outcome, answer):
         if outcome != "answer":
             return False, f"вместо ответа: {outcome}"
         if kind == "range":
-            return len(set(re.findall(r"\b(45[4-9]|460)\b", answer))) >= 4, "статьи не перечислены"
+            ok = len(set(re.findall(r"\b(45[4-9]|460)\b", answer))) >= 4
+            return ok, "" if ok else "статьи не перечислены"
         nums = kind.split(":")[1].split("|")
         ok = any(re.search(rf"стат\w*\s*{n}\b|ст\.?\s*{n}\b", answer, re.I) for n in nums)
         return ok, "" if ok else "нет ссылки на ожидаемую статью"
